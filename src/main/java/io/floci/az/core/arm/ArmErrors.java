@@ -30,4 +30,18 @@ public final class ArmErrors {
     public static Response subscriptionNotFound(String subscriptionId) {
         return error(404, "SubscriptionNotFound", "The subscription '" + subscriptionId + "' could not be found.");
     }
+
+    /** {@code 404 ResourceGroupNotFound} for a resource group that does not exist, with Azure's message. */
+    public static Response resourceGroupNotFound(String resourceGroup) {
+        return error(404, "ResourceGroupNotFound", "Resource group '" + resourceGroup + "' could not be found.");
+    }
+
+    /**
+     * {@code 409 ResourceGroupBeingDeleted} for a write under a resource group whose delete is running. Azure
+     * documents the code; the status and the message are an emulator choice.
+     */
+    public static Response resourceGroupBeingDeleted(String resourceGroup) {
+        return error(409, "ResourceGroupBeingDeleted", "The resource group '" + resourceGroup
+            + "' is in deprovisioning state and cannot perform this operation.");
+    }
 }

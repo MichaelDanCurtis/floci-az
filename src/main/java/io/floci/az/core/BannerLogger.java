@@ -213,9 +213,15 @@ public class BannerLogger {
         Map<String, Boolean> overrides = new LinkedHashMap<>();
         overrides.put("subscription-listing", config.subscriptionListing());
         overrides.put("strict-subscriptions", config.strictSubscriptions());
+        overrides.put("resource-group-semantics", config.resourceGroupSemantics());
+        overrides.put("resource-group-delete", config.resourceGroupDelete());
+        overrides.put("strict-resource-groups", config.strictResourceGroups());
         Map<String, Boolean> levelDefaults = Map.of(
                 "subscription-listing", level.includes(ParityLevel.AZURE),
-                "strict-subscriptions", level.includes(ParityLevel.STRICT));
+                "strict-subscriptions", level.includes(ParityLevel.STRICT),
+                "resource-group-semantics", level.includes(ParityLevel.AZURE),
+                "resource-group-delete", level.includes(ParityLevel.AZURE),
+                "strict-resource-groups", level.includes(ParityLevel.STRICT));
         StringBuilder line = new StringBuilder("parity: ").append(level.name().toLowerCase(Locale.ROOT));
         overrides.forEach((name, value) -> {
             if (!value.equals(levelDefaults.get(name))) {
