@@ -12,6 +12,7 @@ on:
       - 'docker/Dockerfile.native-package'
       - 'docker/entrypoint.sh'
       - 'compatibility-tests/**'
+      - '.github/ci/**'
       - '.github/workflows/compatibility.yml'
 
 permissions:
@@ -22,6 +23,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The Terraform and OpenTofu suites run the same azurerm configuration and are meant to
+  # declare the same resources; a gap must be listed in a .github/ci/compat-iac-allowlist-*.
+  iac-drift-check:
+    name: compat / terraform and opentofu resource parity
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    # Same draft condition as build-native below.
+    if: >-
+      github.event_name != 'pull_request' || (
+        github.event.pull_request.draft == false &&
+        github.event.pull_request.state != 'closed' &&
+        github.event.action != 'edited'
+      )
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            compatibility-tests
+            .github/ci
+
+      - name: Compare compat-terraform and compat-opentofu resources
+        run: python3 .github/ci/compat-iac-drift-check.py
+
   build-native:
     name: Build native floci-az image
     runs-on: ubuntu-24.04-arm
@@ -64,6 +88,21 @@ jobs:
         # maven.test.skip rather than skipTests: skipTests only stops surefire, so the build still
         # compiled all of src/test for a native image that never uses it.
         run: ./mvnw clean package -Dnative -Dmaven.test.skip=true -B -Dquarkus.native.additional-build-args-append="-Ob"
+
+      # Quarkus writes GraalVM's build-output statistics next to the native source jar on every
+      # native build; surfacing them gives each PR a size record (image breakdown plus the gzip
+      # size of the binary, close to the compressed layer Docker Hub reports). Measurement only.
+      - name: Record native build size
+        continue-on-error: true
+        run: python3 .github/ci/native-size-report.py arm64
+
+      - name: Upload native build stats
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-build-stats-arm64
+          path: target/*-native-image-source-jar/*-build-output-stats.json
+          retention-days: 30
 
       - name: Stage native binary for packaging
         run: |
@@ -108,8 +147,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # min_tests: floor on executed test cases, checked after the run. Set loosely, at about
+        # a third of the cases each suite declares, so it trips when a suite loses most of its
+        # tests rather than on ordinary skips; raise it when a suite grows a lot.
         include:
           - test: sdk-test-python
+            min_tests: 50
             emulator_env: >-
               -e FLOCI_AZ_SERVICES_SERVICE_BUS_MOCKED=false
             extra_env: >-
@@ -118,6 +161,7 @@ jobs:
               -e SERVICEBUS_AMQP_PORT=5672
               -e SERVICEBUS_NAMESPACE=default
           - test: sdk-test-java
+            min_tests: 150
             emulator_env: >-
               -e FLOCI_AZ_SERVICES_SERVICE_BUS_MOCKED=false
               -e FLOCI_AZ_SERVICES_SERVICE_BUS_LOCK_DURATION_SECONDS=5
@@ -130,12 +174,14 @@ jobs:
               -e SERVICEBUS_NAMESPACE=default
               -e AZURE_POD_IDENTITY_AUTHORITY_HOST=http://floci-az:4577
           - test: sdk-test-dotnet
+            min_tests: 20
             emulator_env: >-
               -e FLOCI_AZ_SERVICES_SERVICE_BUS_MOCKED=false
             extra_env: >-
               -e SERVICEBUS_HOST=floci-az-servicebus-default
               -e SERVICEBUS_AMQP_PORT=5672
           - test: sdk-test-node
+            min_tests: 30
             emulator_env: >-
               -e FLOCI_AZ_SERVICES_SERVICE_BUS_MOCKED=false
             extra_env: >-
@@ -144,10 +190,14 @@ jobs:
               -e SERVICEBUS_NAMESPACE=default
               -e AZURE_POD_IDENTITY_AUTHORITY_HOST=http://floci-az:4577
           - test: sdk-test-cpp
+            min_tests: 5
             timeout_minutes: 45
           - test: compat-terraform
+            min_tests: 7
           - test: compat-opentofu
+            min_tests: 7
           - test: compat-azcli
+            min_tests: 10
 
     steps:
       - name: Download native floci-az image
@@ -204,7 +254,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: compatibility-tests
+          sparse-checkout: |
+            compatibility-tests
+            .github/ci
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -213,7 +265,8 @@ jobs:
         with:
           context: compatibility-tests/${{ matrix.test }}
           load: true
-          tags: compat-${{ matrix.test }}
+          # Same repo-prefixed tag as the Makefile's suite images.
+          tags: floci-az-${{ matrix.test }}
           # Read-only on purpose. Actions caches are ref-scoped, so a pull_request run's
           # writes land in refs/pull/N/merge, private to that PR: eight images per open PR
           # overran the repo's cache budget and evicted entries between a PR's own runs.
@@ -228,13 +281,35 @@ jobs:
             -e FLOCI_AZ_ENDPOINT=http://floci-az:4577 \
             ${{ matrix.extra_env }} \
             -v "$(pwd)/test-results:/results" \
-            compat-${{ matrix.test }}
+            floci-az-${{ matrix.test }}
+
+      # The container's exit code alone passes a suite whose setup aborted or whose tests all
+      # skipped themselves. Counts executed test cases across the suite's JUnit reports and fails
+      # below the leg's min_tests, so a suite that silently loses most of its tests fails too.
+      - name: Fail a suite that ran no tests
+        run: python3 .github/ci/compat-test-count-check.py --min "${{ matrix.min_tests }}" test-results
 
       - name: Generate test summary
         if: always() && steps.tests.outcome != 'skipped'
         uses: test-summary/action@37b508cfee6d4d080eedd00b5bb240a6a784a6a5 # v2.6
         with:
           paths: test-results/*.xml
+
+      # The suites run their build tools quietly in the container, so the job log has no
+      # per-class timings. Measurement only: a reporting bug must never fail a green leg.
+      - name: Report slowest test classes
+        if: always() && steps.tests.outcome != 'skipped'
+        continue-on-error: true
+        run: python3 .github/ci/compat-timing-report.py test-results
+
+      - name: Upload test results
+        if: always() && steps.tests.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compat-results-${{ matrix.test }}
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Dump floci-az logs
         # A job cancelled at timeout-minutes is not a failure, but a hung suite is the case

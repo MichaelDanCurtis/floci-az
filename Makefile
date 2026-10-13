@@ -26,14 +26,18 @@ AZCLI_DIR      = compatibility-tests/compat-azcli
 COMPAT_NETWORK = compat-net
 COMPAT_RESULTS = test-results
 FLOCI_AZ_IMAGE = floci-az:test
-PYTHON_IMAGE   = compat-sdk-test-python
-JAVA_IMAGE     = compat-sdk-test-java
-NODE_IMAGE     = compat-sdk-test-node
-DOTNET_IMAGE   = compat-sdk-test-dotnet
-CPP_IMAGE      = compat-sdk-test-cpp
-TERRAFORM_IMAGE = compat-terraform
-OPENTOFU_IMAGE  = compat-opentofu
-AZCLI_IMAGE     = compat-azcli
+# Suite image tags carry the repository name: the sibling Floci emulators build suites with the
+# same directory names, and on a shared Docker daemon a generic tag lets whichever repo built last
+# run its tests against this emulator. CI tags its images the same way (compatibility.yml).
+COMPAT_IMAGE_PREFIX = floci-az-
+PYTHON_IMAGE   = $(COMPAT_IMAGE_PREFIX)sdk-test-python
+JAVA_IMAGE     = $(COMPAT_IMAGE_PREFIX)sdk-test-java
+NODE_IMAGE     = $(COMPAT_IMAGE_PREFIX)sdk-test-node
+DOTNET_IMAGE   = $(COMPAT_IMAGE_PREFIX)sdk-test-dotnet
+CPP_IMAGE      = $(COMPAT_IMAGE_PREFIX)sdk-test-cpp
+TERRAFORM_IMAGE = $(COMPAT_IMAGE_PREFIX)compat-terraform
+OPENTOFU_IMAGE  = $(COMPAT_IMAGE_PREFIX)compat-opentofu
+AZCLI_IMAGE     = $(COMPAT_IMAGE_PREFIX)compat-azcli
 
 # ── Per-suite container env — single source of truth ─────────────────────────
 # Every docker run for a suite (individual test-*-compat targets AND compat-docker)
@@ -85,15 +89,21 @@ SUITE_IMAGE_opentofu  = $(OPENTOFU_IMAGE)
 SUITE_IMAGE_azcli     = $(AZCLI_IMAGE)
 
 # ── Canned recipes for Docker compat sessions ─────────────────────────────────
-# One docker run for a suite container against the running emulator.
+# One docker run for a suite container against the running emulator, then the same
+# zero-tests check CI runs: a suite that exits 0 without executing a test fails here.
+# The marker keeps a stale report in a reused results directory from counting.
 # $(call RUN_SUITE,<suite>,<results-subdir>,<env args>,<late args e.g. --entrypoint>,<container cmd>)
+COMPAT_TEST_COUNT_CHECK = python3 $(CURDIR)/.github/ci/compat-test-count-check.py
 define RUN_SUITE
+mkdir -p "$(CURDIR)/$(COMPAT_RESULTS)/$(2)" && \
+touch "$(CURDIR)/$(COMPAT_RESULTS)/$(2)/.run-started" && \
 docker run --rm --network $(COMPAT_NETWORK) \
 	-e FLOCI_AZ_ENDPOINT=http://floci-az:4577 \
 	$(3) \
 	-v "$(CURDIR)/$(COMPAT_RESULTS)/$(2):/results" \
 	$(4) \
-	$(SUITE_IMAGE_$(1)) $(5)
+	$(SUITE_IMAGE_$(1)) $(5) && \
+$(COMPAT_TEST_COUNT_CHECK) --newer-than "$(CURDIR)/$(COMPAT_RESULTS)/$(2)/.run-started" "$(CURDIR)/$(COMPAT_RESULTS)/$(2)"
 endef
 
 # Full session: build + start emulator, build suite image, run suite, always stop.
@@ -172,9 +182,14 @@ compat-run: compat-network
 	@until curl -sf http://127.0.0.1:$(PORT)/health > /dev/null; do sleep 1; done
 	@echo "floci-az Docker emulator is up!"
 
+# Stops the emulator gracefully first so its own shutdown hooks clean up what they can, then
+# reaps every sidecar it spawned: anything on the compat network carrying the label the
+# emulator stamps on each container it creates (floci_emulator=floci-az). Both filters must
+# match, so a floci-az started outside this session or an unrelated container is never touched.
 compat-stop:
-	@SIDECARS=$$(docker ps -aq --filter "network=$(COMPAT_NETWORK)" --filter "name=floci-az-servicebus-"); \
-	if [ -n "$$SIDECARS" ]; then docker rm -f $$SIDECARS >/dev/null 2>&1 || true; fi
+	@docker stop -t 30 floci-az >/dev/null 2>&1 || true
+	@SIDECARS=$$(docker ps -aq --filter "network=$(COMPAT_NETWORK)" --filter "label=floci_emulator=floci-az"); \
+	if [ -n "$$SIDECARS" ]; then docker rm -f -v $$SIDECARS >/dev/null 2>&1 || true; fi
 	@docker rm -f floci-az >/dev/null 2>&1 || true
 	@docker network rm $(COMPAT_NETWORK) >/dev/null 2>&1 || true
 
