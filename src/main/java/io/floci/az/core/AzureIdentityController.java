@@ -1,10 +1,14 @@
 package io.floci.az.core;
 
 import io.floci.az.config.EmulatorConfig;
+import io.floci.az.core.cloud.CloudCatalog;
+import io.floci.az.core.cloud.CloudMetadata;
+import io.floci.az.core.cloud.CloudProfile;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
@@ -27,14 +31,65 @@ public class AzureIdentityController {
     // OAuth2 token endpoints (common/{tenant}/oauth2[/v2.0]/token), JWKS and OpenID discovery
     // are served by EntraServiceHandler via AzureRoutingFilter's pre-matching dispatch.
 
-    // ARM environment discovery — called by go-azure-sdk (Azure Stack mode via metadata_host).
-    // Format follows the 2022-09-01 metadata schema used by hashicorp/go-azure-sdk.
-    // Suffixes are required so go-azure-sdk populates env.Storage/env.KeyVault with a
-    // resource identifier; the actual data-plane URLs come from ARM primaryEndpoints/vaultUri.
+    /**
+     * ARM environment discovery, in the shape the requested api-version defines:
+     *
+     * <ul>
+     *   <li>{@value CloudMetadata#CLOUD_LIST_VERSION}: a list of clouds, for the az CLI's
+     *       {@code ARM_CLOUD_METADATA_URL} ({@link CloudMetadata#cloudList})</li>
+     *   <li>{@value CloudMetadata#CLOUD_ENDPOINT_VERSION}: the {@code cloudEndpoint} document azurerm reads for
+     *       location validation ({@link CloudMetadata#cloudEndpoints})</li>
+     *   <li>any other version, {@code 2022-09-01} among them, or none: the single object go-azure-sdk (azurerm's
+     *       {@code metadata_host}) and {@code az cloud register} read</li>
+     * </ul>
+     *
+     * Every endpoint a client calls is the emulator's own base URL. The first two shapes come from the default
+     * cloud's catalog payloads.
+     */
     @GET
     @Path("metadata/endpoints")
     @Produces(MediaType.APPLICATION_JSON)
-    public Response metadataEndpoints(@Context UriInfo uriInfo, @Context HttpHeaders headers) {
+    public Response metadataEndpoints(@Context UriInfo uriInfo, @Context HttpHeaders headers,
+                                      @QueryParam("api-version") String apiVersion) {
+        String baseUrl = baseUrl(uriInfo, headers);
+        if (CloudMetadata.CLOUD_LIST_VERSION.equals(apiVersion)) {
+            return Response.ok(CloudMetadata.cloudList(defaultCloud(), baseUrl)).build();
+        }
+        if (CloudMetadata.CLOUD_ENDPOINT_VERSION.equals(apiVersion)) {
+            return Response.ok(CloudMetadata.cloudEndpoints(defaultCloud(), baseUrl)).build();
+        }
+        // The 2022-09-01 schema used by hashicorp/go-azure-sdk. Suffixes are required so go-azure-sdk populates
+        // env.Storage/env.KeyVault with a resource identifier; the actual data-plane URLs come from ARM
+        // primaryEndpoints/vaultUri.
+        return Response.ok(Map.of(
+            "name",                     CloudMetadata.EMULATOR_CLOUD_NAME,
+            // No trailing slash: in Azure Stack mode the go-azure-sdk concatenates this
+            // endpoint with leading-slash resource paths, so a trailing slash yields
+            // "//subscriptions/..." — a network-path reference that breaks the SDK's LRO
+            // poller URL resolution (it drops the resource name and polls the collection
+            // forever, e.g. hanging `terraform destroy` of a virtual machine).
+            "resourceManager",          baseUrl,
+            "microsoftGraphResourceId", baseUrl + "/",
+            "portal",                   baseUrl + "/",
+            "gallery",                  baseUrl + "/",
+            "authentication", Map.of(
+                "loginEndpoint",    baseUrl + "/",
+                "audiences",        List.of(baseUrl + "/"),
+                "identityProvider", "AAD",
+                "tenant",           "common"
+            ),
+            "suffixes", Map.of(
+                "storage",     "core.windows.net",
+                "keyVaultDns", "vault.azure.net"
+            )
+        )).build();
+    }
+
+    private CloudProfile defaultCloud() {
+        return CloudCatalog.forNameOrPublic(config.cloud().defaultCloud());
+    }
+
+    private static String baseUrl(UriInfo uriInfo, HttpHeaders headers) {
         // Derive base URL from the incoming request so the returned endpoints are
         // always reachable by the caller (host-network, Docker bridge, or TLS).
         String baseUrl = uriInfo.getBaseUri().toString().replaceAll("/+$", "");
@@ -56,27 +111,6 @@ public class AzureIdentityController {
                 baseUrl = baseUrl.replaceFirst("^https?://", scheme + "://");
             }
         }
-        return Response.ok(Map.of(
-            "name",                     "floci-az",
-            // No trailing slash: in Azure Stack mode the go-azure-sdk concatenates this
-            // endpoint with leading-slash resource paths, so a trailing slash yields
-            // "//subscriptions/..." — a network-path reference that breaks the SDK's LRO
-            // poller URL resolution (it drops the resource name and polls the collection
-            // forever, e.g. hanging `terraform destroy` of a virtual machine).
-            "resourceManager",          baseUrl,
-            "microsoftGraphResourceId", baseUrl + "/",
-            "portal",                   baseUrl + "/",
-            "gallery",                  baseUrl + "/",
-            "authentication", Map.of(
-                "loginEndpoint",    baseUrl + "/",
-                "audiences",        List.of(baseUrl + "/"),
-                "identityProvider", "AAD",
-                "tenant",           "common"
-            ),
-            "suffixes", Map.of(
-                "storage",     "core.windows.net",
-                "keyVaultDns", "vault.azure.net"
-            )
-        )).build();
+        return baseUrl;
     }
 }
