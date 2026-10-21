@@ -135,6 +135,27 @@ public interface EmulatorConfig {
     }
 
     /**
+     * Whether ARM locations are canonical, as Azure stores them: a PUT or PATCH body's {@code location} is
+     * normalized for the subscription's cloud ({@code "East US"} becomes {@code eastus}) before its handler runs,
+     * so it is stored and echoed that way and every name built from it (ACI and AKS FQDNs, the AKS node resource
+     * group) uses it; a type that inherits its group's location gets it when the body names none, and a global
+     * type gets {@code global}. On from {@code parity: azure}; {@code parity-overrides.location-normalize}
+     * overrides it either way.
+     */
+    default boolean locationNormalize() {
+        return parityOverrides().locationNormalize().orElse(parity().includes(ParityLevel.AZURE));
+    }
+
+    /**
+     * Whether a resource PUT naming a location its subscription's cloud does not offer is refused with
+     * {@code 400 NoRegisteredProviderFound}, Azure's answer. On from {@code parity: strict};
+     * {@code parity-overrides.strict-locations} overrides it either way.
+     */
+    default boolean strictLocations() {
+        return parityOverrides().strictLocations().orElse(parity().includes(ParityLevel.STRICT));
+    }
+
+    /**
      * {@code floci-az.parity-overrides}: each switch is unset by default and then follows {@link #parity()}.
      * Later phases add their own switches here.
      */
@@ -156,6 +177,12 @@ public interface EmulatorConfig {
 
         /** Default: on from {@code parity: strict}. Read through {@link EmulatorConfig#strictProviders()}. */
         Optional<Boolean> strictProviders();
+
+        /** Default: on from {@code parity: azure}. Read through {@link EmulatorConfig#locationNormalize()}. */
+        Optional<Boolean> locationNormalize();
+
+        /** Default: on from {@code parity: strict}. Read through {@link EmulatorConfig#strictLocations()}. */
+        Optional<Boolean> strictLocations();
     }
 
     /** The cloud a tenant lives in when nothing else names one. */

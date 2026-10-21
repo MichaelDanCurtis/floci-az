@@ -25,7 +25,7 @@ Managed Identity, and the other `Microsoft.*` providers).
   owned by one tenant, in one state). `GET /tenants` and `GET /subscriptions` (enumeration, used by
   `az login`) list it; an unknown subscription id is registered on first use, or refused with
   `404 SubscriptionNotFound` under `parity: strict`
-- **Locations**: `GET /subscriptions/{sub}/locations`, the public-cloud region catalog read by
+- **Locations**: `GET /subscriptions/{sub}/locations`, the region catalog of the subscription's cloud, read by
   `az account list-locations`, the CLI's display-name location translation (`-l "East US"`), and
   Terraform's `data.azurerm_location`
 - **Resource groups**: CreateOrUpdate, Get, CheckExistence (`HEAD`), Update (`PATCH`), Delete, List
@@ -114,6 +114,8 @@ floci-az:
   #   resource-group-delete: true    # default: on from azure
   #   strict-resource-groups: true   # default: on from strict
   #   strict-providers: true         # default: on from strict
+  #   location-normalize: true       # default: on from azure
+  #   strict-locations: true         # default: on from strict
   cloud:
     default: AzureCloud
   services:
@@ -136,7 +138,7 @@ floci-az:
 | `parity-overrides.resource-group-semantics` | `FLOCI_AZ_PARITY_OVERRIDES_RESOURCE_GROUP_SEMANTICS` | on from `azure` | `true`: a resource-group re-PUT answers `200`, a resource PUT under a missing group creates the group, and groups persist in the directory store |
 | `parity-overrides.resource-group-delete` | `FLOCI_AZ_PARITY_OVERRIDES_RESOURCE_GROUP_DELETE` | on from `azure` | `true`: a resource-group `DELETE` deletes every resource in the group and answers `202` with a `Location` to poll; the generic listings also show Event Grid, Monitor and Email resources |
 | `parity-overrides.strict-resource-groups` | `FLOCI_AZ_PARITY_OVERRIDES_STRICT_RESOURCE_GROUPS` | on from `strict` | `true`: a request for a resource under a group that does not exist is `404 ResourceGroupNotFound`, and groups are kept in the directory store |
-| `cloud.default` | `FLOCI_AZ_CLOUD_DEFAULT` | `AzureCloud` | The cloud of the default tenant and of a tenant that names none: `AzureCloud`, `AzureUSGovernment` or `AzureChinaCloud`. An unknown name fails startup. Today it changes which cloud tenants and request scopes resolve to and the default location of a new group; endpoints, token issuers, DNS suffixes, TLS names and `/locations` stay the public cloud's, and a startup warning says so |
+| `cloud.default` | `FLOCI_AZ_CLOUD_DEFAULT` | `AzureCloud` | The cloud of the default tenant and of a tenant that names none: `AzureCloud`, `AzureUSGovernment` or `AzureChinaCloud`. An unknown name fails startup. Today it changes which cloud tenants and request scopes resolve to and the default location of a new group; endpoints, token issuers, DNS suffixes and TLS names stay the public cloud's, and a startup warning says so |
 | `tenants[n].*` | `FLOCI_AZ_TENANTS_<n>__ID`, `..._DISPLAY_NAME`, `..._DEFAULT_DOMAIN`, `..._CLOUD` | none | Extra tenants; see below |
 | `subscriptions[n].*` | `FLOCI_AZ_SUBSCRIPTIONS_<n>__ID`, `..._TENANT_ID`, `..._DISPLAY_NAME`, `..._STATE` | none | Extra subscriptions; see below |
 | `storage.services.directory.mode` | `FLOCI_AZ_STORAGE_SERVICES_DIRECTORY_MODE` | `storage.mode` | Storage mode of the tenant and subscription directory |
@@ -219,8 +221,8 @@ can also be set alone to opt in piecemeal:
 | Level | What changes |
 |---|---|
 | `compat` (default) | Nothing a client could rely on: unknown subscriptions are registered internally on first use but not listed, ids are echoed as sent, and resource groups answer as they always have (every PUT `201`, `DELETE` `200` without cascade) |
-| `azure` | Azure's answers for the requests Azure accepts. Every parity override on: `subscription-listing`, `resource-group-semantics`, `resource-group-delete` |
-| `strict` | `azure` plus Azure's refusals, every `strict-*` override: `strict-subscriptions`, `strict-resource-groups`, `strict-providers` |
+| `azure` | Azure's answers for the requests Azure accepts. Every parity override on: `subscription-listing`, `resource-group-semantics`, `resource-group-delete`, `location-normalize` |
+| `strict` | `azure` plus Azure's refusals, every `strict-*` override: `strict-subscriptions`, `strict-resource-groups`, `strict-providers`, `strict-locations` |
 
 `auth.mode` plays no part in any of this. The startup banner prints `parity: <level>` followed by every
 override set to a value its level would not give it. At the default level the line also names the
@@ -334,6 +336,36 @@ Providers API answering one), and the `capabilities` string (`SupportsTags, Supp
 with a location of its own, `None` otherwise). `defaultApiVersion`, `apiProfiles`, `zoneMappings` and
 `authorizations` are optional in Azure's answer and omitted.
 
+## Resource locations
+
+By default a resource's `location` is stored and echoed exactly as the client sent it, so `"East US"` and
+`eastus` are two different values, and names built from it keep the spelling: a container group's FQDN,
+an AKS cluster's FQDN and its `MC_<group>_<cluster>_<location>` node resource group.
+
+With `location-normalize` (on from `parity: azure`) the request gate rewrites the `location` of every
+PUT or PATCH body of a served resource type before its handler runs, for the cloud the subscription
+belongs to, as Azure stores it:
+
+- a display name or any casing becomes the canonical name: `"East US 2"` is stored and echoed as
+  `eastus2`, and the ACI and AKS names above use it
+- a global type (DNS zones, private DNS zones and their virtual network links, Communication and Email
+  services) is `global` whatever the client sends, and a PUT that names no location gets `global`
+- a type whose location defaults to its group's gets the group's location when a PUT names none
+
+With `strict-locations` (on from `parity: strict`) a PUT of a regional resource naming a location its
+subscription's cloud does not offer is refused before its handler runs with Azure's
+`400 NoRegisteredProviderFound`: "No registered resource provider found for location '<location>' and API
+version '<version>' for type '<type>'. The supported api-versions are '…'. The supported locations are
+'…'." `global` is always accepted. A PATCH, a child resource and a global type are never refused.
+
+Both run before policy evaluation, so policy conditions see the canonical location. A location a policy
+`append` adds or changes is checked again after policy, the same way: normalized under `location-normalize`
+and refused under `strict-locations`.
+
+Emulator choices, with no Azure source to settle them: which declared types count as global follows each
+service's declaration; the supported locations in the message are every location of the cloud, where Azure
+lists the ones the type is offered in.
+
 ## Resource names across subscriptions
 
 Two subscriptions can use the same resource-group name, and most resources then coexist: each
@@ -378,12 +410,14 @@ servers is not publicly documented either; `409` is the likeliest.
   configured with its own subscription id keeps working. ARM state is kept per subscription.
 - **The caller's tenant is the default tenant**: `GET /subscriptions` and `GET /tenants` are not yet
   scoped by the token's tenant.
-- **Locations are a static public-cloud catalog**: region names and display names come from the
+- **Locations are a static catalog per cloud**: a subscription lists the regions of the cloud its tenant
+  belongs to (the public cloud's 51, US Gov's 6 or China's 6), with names and display names from the
   Azure SDK's region list; every entry is a physical region with zones 1 to 3 mapped to
   `<region>-az<n>`. `regionalDisplayName` repeats `displayName`, and `geography`, `geographyGroup`,
   `latitude`, `longitude`, `physicalLocation` and `pairedRegion` are omitted. There are no edge zones,
-  so `includeExtendedLocations=true` returns the same list. Location values on resources are echoed,
-  not validated.
+  so `includeExtendedLocations=true` returns the same list. Location values on resources are echoed as
+  sent and not validated unless `location-normalize` or `strict-locations` is on (see
+  [Resource locations](#resource-locations)).
 - **ARM state is in-memory**: resource groups and the ARM shells do not persist across restarts; only
   the tenant and subscription directory follows `storage.mode`, and resource groups too under
   `resource-group-semantics`.
