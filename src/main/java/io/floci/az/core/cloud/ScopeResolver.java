@@ -1,6 +1,8 @@
 package io.floci.az.core.cloud;
 
+import io.floci.az.config.EmulatorConfig;
 import io.floci.az.core.arm.ArmResourceId;
+import io.floci.az.core.auth.TokenTenantHint;
 import io.floci.az.core.directory.AzureDirectory;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -12,6 +14,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -34,9 +37,13 @@ import java.util.function.Supplier;
  * another tenant, a subscription nobody registered) is the job of the ARM request gate's rules.
  *
  * <p>{@link #tenantOfSubscription} and {@link #cloudOfTenant} ask the tenant and subscription directory
- * ({@link AzureDirectory}); a subscription it does not hold yet resolves to the default tenant, which is where
- * first use registers it. Signal 4 waits for the global-name registry, and the token's {@code tid} is left
- * null until the bearer verifier exposes parsed claims.
+ * ({@link AzureDirectory}); a subscription it does not hold yet resolves to the tenant its first use registers it
+ * under: the caller's under tenant scoping when the directory holds that tenant, the default tenant otherwise.
+ * Signal 4 waits for the global-name registry.
+ *
+ * <p>The token's {@code tid} ({@link ScopeContext#tokenTenantId()}) is read only under
+ * {@link EmulatorConfig#tenantScoping()}, unverified, as a hint of the caller's tenant ({@link TokenTenantHint});
+ * otherwise it stays null and every caller is the default tenant, as floci-az has always answered.
  */
 @ApplicationScoped
 public class ScopeResolver {
@@ -49,27 +56,36 @@ public class ScopeResolver {
 
     private static final String USER_REALM_PREFIX = "common/userrealm/";
 
-    private final Function<String, String> tenantOfSubscription;
+    /** (subscription, caller's token tenant or null) to the subscription's tenant. */
+    private final BiFunction<String, String, String> tenantOfSubscription;
     private final Function<String, CloudProfile> cloudOfTenant;
     private final CloudProfile defaultCloud;
     private final Map<String, CloudProfile> cloudHosts;
+    private final boolean readTokenTenant;
 
     @Inject
-    public ScopeResolver(AzureDirectory directory) {
-        this(directory::tenantOfSubscription, directory::cloudOfTenant, directory.defaultCloud());
+    public ScopeResolver(AzureDirectory directory, EmulatorConfig config) {
+        this(directory::tenantOfSubscription, directory::cloudOfTenant, directory.defaultCloud(),
+            config.tenantScoping());
     }
 
     /** One tenant in one cloud: every subscription is {@code defaultTenantId}'s, every tenant is in {@code defaultCloud}. */
     ScopeResolver(Supplier<String> defaultTenantId, CloudProfile defaultCloud) {
-        this(subscription -> defaultTenantId.get(), tenant -> defaultCloud, defaultCloud);
+        this((subscription, caller) -> defaultTenantId.get(), tenant -> defaultCloud, defaultCloud, false);
     }
 
     ScopeResolver(Function<String, String> tenantOfSubscription, Function<String, CloudProfile> cloudOfTenant,
                   CloudProfile defaultCloud) {
+        this((subscription, caller) -> tenantOfSubscription.apply(subscription), cloudOfTenant, defaultCloud, false);
+    }
+
+    ScopeResolver(BiFunction<String, String, String> tenantOfSubscription,
+                  Function<String, CloudProfile> cloudOfTenant, CloudProfile defaultCloud, boolean readTokenTenant) {
         this.tenantOfSubscription = tenantOfSubscription;
         this.cloudOfTenant = cloudOfTenant;
         this.defaultCloud = defaultCloud;
         this.cloudHosts = cloudHosts(CloudCatalog.all());
+        this.readTokenTenant = readTokenTenant;
     }
 
     /**
@@ -99,19 +115,30 @@ public class ScopeResolver {
     }
 
     /**
-     * Resolves the scope of one request.
+     * Resolves the scope of one request that carries no token, or whose token is not read.
      *
      * @param path the decoded request path without its leading slash
      * @param host the request host, lowercase and without a port; may be null
      */
     public ScopeContext resolve(String path, String host) {
+        return resolve(path, host, null);
+    }
+
+    /**
+     * Resolves the scope of one request.
+     *
+     * @param path          the decoded request path without its leading slash
+     * @param host          the request host, lowercase and without a port; may be null
+     * @param authorization the request's {@code Authorization} header value; may be null
+     */
+    public ScopeContext resolve(String path, String host, String authorization) {
         String safePath = path == null ? "" : path;
-        String tokenTenantId = null;
+        String tokenTenantId = readTokenTenant ? TokenTenantHint.of(authorization).orElse(null) : null;
 
         Optional<ArmResourceId> armId = ArmResourceId.parse(safePath);
         if (armId.isPresent() && armId.get().subscriptionId() != null) {
             String subscription = armId.get().subscriptionId();
-            String tenant = tenantOfSubscription(subscription);
+            String tenant = tenantOfSubscription.apply(subscription, tokenTenantId);
             return new ScopeContext(cloudOfTenant(tenant), tenant, subscription, armId.get().resourceGroup(),
                 tokenTenantId, ScopeSource.ARM_PATH);
         }
@@ -146,7 +173,7 @@ public class ScopeResolver {
 
     /** The tenant a subscription belongs to: the directory's answer, the default tenant for an unknown one. */
     String tenantOfSubscription(String subscriptionId) {
-        return tenantOfSubscription.apply(subscriptionId);
+        return tenantOfSubscription.apply(subscriptionId, null);
     }
 
     /** The cloud a tenant lives in: the directory's answer, the default cloud for an unknown tenant. */
