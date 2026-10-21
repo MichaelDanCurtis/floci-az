@@ -8,6 +8,7 @@ import io.floci.az.core.AzureServiceHandler;
 import io.floci.az.core.Resettable;
 import io.floci.az.core.ServiceRoutes;
 import io.floci.az.core.StoredObject;
+import io.floci.az.core.SyntheticHttpHeaders;
 import io.floci.az.core.XmlBuilder;
 import io.floci.az.core.XmlUtils;
 import io.floci.az.core.auth.StorageSasAuthorization;
@@ -22,6 +23,7 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -340,6 +342,8 @@ public class BlobServiceHandler implements AzureServiceHandler, Resettable {
                 } else if (("GET".equalsIgnoreCase(method) || "HEAD".equalsIgnoreCase(method))
                         && "blocklist".equals(comp)) {
                     response = getBlockList(request, containerName, blobName);
+                } else if ("PUT".equalsIgnoreCase(method) && isCopyBlob(request, comp)) {
+                    response = copyBlob(request, containerName, blobName);
                 } else if ("PUT".equalsIgnoreCase(method) && isPutBlob(request, comp)) {
                     response = putBlob(request, containerName, blobName);
                 } else if (dataLakeRequest && "GET".equalsIgnoreCase(method)) {
@@ -430,6 +434,18 @@ public class BlobServiceHandler implements AzureServiceHandler, Resettable {
      * with the request body — usually empty — and answers 201, so the caller sees success while the
      * content is destroyed. Only an unqualified PUT is a PutBlob.
      */
+    /**
+     * Copy Blob ({@code Blob_StartCopyFromURL}) or Copy Blob From URL ({@code Blob_CopyFromURL}, with
+     * {@code x-ms-requires-sync: true}): an unqualified PUT naming {@code x-ms-copy-source}. Put Blob From URL
+     * ({@code BlockBlob_PutBlobFromUrl}) sends the same header with {@code x-ms-blob-type} and is a different
+     * operation (201, content headers), so it is left to the not-implemented answer rather than copied.
+     */
+    private boolean isCopyBlob(AzureRequest request, String comp) {
+        return comp == null
+                && request.headers().getHeaderString("x-ms-copy-source") != null
+                && request.headers().getHeaderString("x-ms-blob-type") == null;
+    }
+
     private boolean isPutBlob(AzureRequest request, String comp) {
         return comp == null
                 && request.headers().getHeaderString("x-ms-copy-source") == null
@@ -628,6 +644,154 @@ public class BlobServiceHandler implements AzureServiceHandler, Resettable {
         }
     }
 
+    /**
+     * PUT /{container}/{blob} with {@code x-ms-copy-source}: Copy Blob, or Copy Blob From URL when
+     * {@code x-ms-requires-sync: true} is sent. Both answer {@code 202 Accepted}, the only status the spec
+     * declares for either; the emulator copies at once, so the copy status is already {@code success}.
+     *
+     * <p>Only intra-emulator copies are supported: the source ({@link CopySource}) must name a blob, or a
+     * snapshot of one, held by this handler, in any account.</p>
+     */
+    private Response copyBlob(AzureRequest request, String containerName, String blobName) {
+        Optional<CopySource> parsedSource =
+                CopySource.parse(request.headers().getHeaderString("x-ms-copy-source"));
+        if (parsedSource.isEmpty()) {
+            return new AzureErrorResponse("InvalidHeaderValue",
+                    "The value for one of the HTTP headers is not in the correct format.")
+                    .toXmlResponse(Response.Status.BAD_REQUEST.getStatusCode());
+        }
+        CopySource copySource = parsedSource.get();
+        Response sourceAccess = authorizeCopySource(request, copySource);
+        if (sourceAccess != null) {
+            return sourceAccess;
+        }
+
+        return leaseService.exclusively(() -> {
+            // As Put Blob does: a new destination needs create permission, an existing one write permission.
+            Optional<StoredObject> existing = store.get(
+                    objKey(request.accountName(), containerName, blobName));
+            Response authFailure = existing.isPresent()
+                    ? authorizeWrite(request, containerName, blobName)
+                    : authorizeCreate(request, containerName, blobName);
+            if (authFailure != null) {
+                return authFailure;
+            }
+
+            // Validate destination container exists
+            if (store.get(nsKey(request.accountName(), containerName)).isEmpty()) {
+                return new AzureErrorResponse("ContainerNotFound",
+                        "The specified container does not exist.")
+                        .toXmlResponse(Response.Status.NOT_FOUND.getStatusCode());
+            }
+
+            // Validate source blob exists
+            Optional<StoredObject> sourceObject = store.get(copySource.snapshot() == null
+                    ? objKey(copySource.account(), copySource.container(), copySource.blob())
+                    : snapshotKey(copySource.account(), copySource.container(), copySource.blob(),
+                            copySource.snapshot()));
+            if (sourceObject.isEmpty()) {
+                return new AzureErrorResponse("BlobNotFound",
+                        "The specified blob does not exist.")
+                        .toXmlResponse(Response.Status.NOT_FOUND.getStatusCode());
+            }
+
+            // Validate conditions on the destination
+            Response conditionFailure = validateBlobConditions(request, existing);
+            if (conditionFailure != null) {
+                return conditionFailure;
+            }
+            Response leaseFailure = leaseService.validateWrite(request,
+                    objKey(request.accountName(), containerName, blobName));
+            if (leaseFailure != null) {
+                return leaseFailure;
+            }
+
+            StoredObject source = sourceObject.get();
+            String sourceType = source.metadata().getOrDefault("BlobType", "BlockBlob");
+            if (existing.isPresent()
+                    && !sourceType.equalsIgnoreCase(existing.get().metadata().getOrDefault("BlobType", "BlockBlob"))) {
+                return new AzureErrorResponse("InvalidBlobType", "The blob type is invalid for this operation.")
+                        .toXmlResponse(Response.Status.CONFLICT.getStatusCode());
+            }
+
+            // Build destination metadata: if the request carries x-ms-meta-* headers,
+            // use those; otherwise copy metadata from the source.
+            Map<String, String> destMeta = new HashMap<>();
+            // Carry over structural metadata from the source
+            source.metadata().forEach((key, value) -> {
+                if (!key.startsWith(USER_METADATA_PREFIX) && !BlobTags.METADATA_KEY.equals(key)) {
+                    destMeta.put(key, value);
+                }
+            });
+            Map<String, String> requestMeta = readUserMetadata(request);
+            if (requestMeta.isEmpty()) {
+                // No user metadata on request — copy from source
+                source.metadata().forEach((key, value) -> {
+                    if (key.startsWith(USER_METADATA_PREFIX)) {
+                        destMeta.put(key, value);
+                    }
+                });
+            } else {
+                destMeta.putAll(requestMeta);
+            }
+            destMeta.put("Name", blobName);
+            destMeta.put(CREATION_TIME_KEY, createdOn(existing).toString());
+            // Tags are the request's, as Azurite sets them; Copy Blob From URL may keep the source's instead.
+            boolean copySourceTags = "true".equalsIgnoreCase(request.headers().getHeaderString("x-ms-requires-sync"))
+                    && "COPY".equalsIgnoreCase(request.headers().getHeaderString("x-ms-copy-source-tag-option"));
+            if (copySourceTags) {
+                BlobTags.store(destMeta, BlobTags.of(source.metadata()));
+            } else {
+                Response tagFailure = applyRequestTags(request, destMeta);
+                if (tagFailure != null) {
+                    return tagFailure;
+                }
+            }
+
+            Instant now = Instant.now();
+            String etag = UUID.randomUUID().toString();
+            String copyId = UUID.randomUUID().toString();
+            store.put(objKey(request.accountName(), containerName, blobName),
+                    new StoredObject(blobName,
+                            Arrays.copyOf(source.data(), source.data().length),
+                            destMeta, now, etag));
+            // As Put Blob does: appends staged against the old blob must not be flushed into the copy.
+            clearDataLakeAppendChunks(request.accountName(), containerName, blobName);
+
+            Response.ResponseBuilder rb = Response.status(Response.Status.ACCEPTED)
+                    .header("Last-Modified", RFC1123_DATE_TIME.format(now))
+                    .header("ETag", etag)
+                    .header("x-ms-copy-id", copyId)
+                    .header("x-ms-copy-status", "success")
+                    .header("x-ms-request-server-encrypted", "true")
+                    .header("Content-Length", 0);
+            return rb.build();
+        });
+    }
+
+    /**
+     * The access check Azurite makes on a copy source that carries a SAS: the source is read as an anonymous request
+     * with the source URL's query, in the source's account, and a failed check is answered
+     * {@code CannotVerifyCopySource} with the status that read got. A source without a SAS needs no check, since
+     * floci-az enforces only SAS tokens and lets every other read through.
+     */
+    private Response authorizeCopySource(AzureRequest request, CopySource source) {
+        Map<String, String> query = source.singleQuery();
+        Optional<StorageSasToken> token = StorageSasToken.from(query);
+        if (token.isEmpty()) {
+            return null;
+        }
+        String path = source.container() + "/" + source.blob();
+        AzureRequest sourceRead = new AzureRequest("GET", source.account(), request.serviceType(), path,
+                new SyntheticHttpHeaders(Map.of()), InputStream.nullInputStream(), query, source.query(), null,
+                request.secure(), request.host(), request.remoteAddress(), path, null, request.authority());
+        return sasAuthorization.authorizeRead(sourceRead, source.container(), source.blob(), token.get())
+                .map(denied -> new AzureErrorResponse("CannotVerifyCopySource",
+                        "Server failed to authenticate the request. Make sure the value of Authorization header is "
+                                + "formed correctly including the signature.")
+                        .toXmlResponse(denied.getStatus()))
+                .orElse(null);
+    }
 
     // ── ADLS Gen2 filesystem/path compatibility for Hadoop ABFS 3.3.4 ───────
 

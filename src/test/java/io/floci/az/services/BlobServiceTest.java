@@ -9,15 +9,18 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -3516,6 +3519,475 @@ public class BlobServiceTest {
             .queryParam("close", true)
             .when().put("/{container}/{path}", CONTAINER, path)
             .then().statusCode(200);
+    }
+
+    // ── Copy Blob tests ──────────────────────────────────────────────────
+
+    @Test
+    void copyBlobWithinSameContainer() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+
+        // Copy Blob (async style — no x-ms-requires-sync)
+        given()
+            .header("x-ms-copy-source",
+                    "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB)
+            .when()
+            .put("/{account}/{container}/copied-blob.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(202)
+            .header("x-ms-copy-status", "success")
+            .header("x-ms-copy-id", notNullValue())
+            .header("ETag", notNullValue());
+
+        // Verify the copied blob is readable and has the same content
+        given()
+            .when().get("/{account}/{container}/copied-blob.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(200)
+            .body(equalTo(BLOB_CONTENT));
+    }
+
+    @Test
+    void copyBlobFromUrlSyncAnswers202() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+
+        // Copy Blob From URL (sync — x-ms-requires-sync: true)
+        given()
+            .header("x-ms-copy-source",
+                    "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB)
+            .header("x-ms-requires-sync", "true")
+            .when()
+            .put("/{account}/{container}/sync-copied.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(202)
+            .header("x-ms-copy-status", "success")
+            .header("x-ms-copy-id", notNullValue());
+
+        given()
+            .when().get("/{account}/{container}/sync-copied.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(200)
+            .body(equalTo(BLOB_CONTENT));
+    }
+
+    @Test
+    void copyBlobAcrossContainers() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+        given().put("/{account}/dest-container?restype=container", ACCOUNT);
+
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+
+        given()
+            .header("x-ms-copy-source",
+                    "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB)
+            .when()
+            .put("/{account}/dest-container/cross-copy.txt", ACCOUNT)
+            .then()
+            .statusCode(202)
+            .header("x-ms-copy-status", "success");
+
+        given()
+            .when().get("/{account}/dest-container/cross-copy.txt", ACCOUNT)
+            .then()
+            .statusCode(200)
+            .body(equalTo(BLOB_CONTENT));
+    }
+
+    @Test
+    void copyBlobCopiesMetadata() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .header("x-ms-meta-author", "alice")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+
+        // Copy without specifying metadata — should inherit from source
+        given()
+            .header("x-ms-copy-source",
+                    "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB)
+            .when()
+            .put("/{account}/{container}/meta-copy.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(202);
+
+        given()
+            .when().get("/{account}/{container}/meta-copy.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(200)
+            .header("x-ms-meta-author", "alice");
+    }
+
+    @Test
+    void copyBlobReplacesMetadataWhenProvided() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .header("x-ms-meta-author", "alice")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+
+        // Copy with new metadata — should NOT inherit source metadata
+        given()
+            .header("x-ms-copy-source",
+                    "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB)
+            .header("x-ms-meta-reviewer", "bob")
+            .when()
+            .put("/{account}/{container}/replaced-meta.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(202);
+
+        given()
+            .when().get("/{account}/{container}/replaced-meta.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(200)
+            .header("x-ms-meta-reviewer", "bob")
+            .header("x-ms-meta-author", nullValue());
+    }
+
+    @Test
+    void copyBlobSourceNotFoundReturns404() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+
+        given()
+            .header("x-ms-copy-source",
+                    "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/nonexistent.txt")
+            .when()
+            .put("/{account}/{container}/will-fail.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(404);
+    }
+
+    @Test
+    void copyBlobDestContainerNotFoundReturns404() {
+        given()
+            .header("x-ms-copy-source",
+                    "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB)
+            .when()
+            .put("/{account}/no-such-container/will-fail.txt", ACCOUNT)
+            .then()
+            .statusCode(404);
+    }
+
+    @Test
+    void copyBlobInvalidSourceReturns400() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+
+        given()
+            .header("x-ms-copy-source", "http://localhost:8081/" + ACCOUNT)
+            .when()
+            .put("/{account}/{container}/will-fail.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(400);
+    }
+
+    @Test
+    void copyBlobOverwritesExistingBlob() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body("original")
+            .put("/{account}/{container}/target.txt", ACCOUNT, CONTAINER);
+
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body("new-source-data")
+            .put("/{account}/{container}/source.txt", ACCOUNT, CONTAINER);
+
+        given()
+            .header("x-ms-copy-source",
+                    "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/source.txt")
+            .when()
+            .put("/{account}/{container}/target.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(202);
+
+        given()
+            .when().get("/{account}/{container}/target.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(200)
+            .body(equalTo("new-source-data"));
+    }
+
+    @Test
+    void copyBlobWithRelativeSourcePath() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+
+        // Use a path-only source (no scheme/authority)
+        given()
+            .header("x-ms-copy-source",
+                    "/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB)
+            .when()
+            .put("/{account}/{container}/path-copy.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(202)
+            .header("x-ms-copy-status", "success");
+
+        given()
+            .when().get("/{account}/{container}/path-copy.txt", ACCOUNT, CONTAINER)
+            .then()
+            .statusCode(200)
+            .body(equalTo(BLOB_CONTENT));
+    }
+
+    @Test
+    void copyBlobFromAHostStyleSourceUrl() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+
+        given()
+            .header("x-ms-copy-source", "http://" + ACCOUNT + ".blob.localhost:4577/" + CONTAINER + "/" + BLOB)
+            .when().put("/{account}/{container}/host-style-copy.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(202);
+
+        given()
+            .when().get("/{account}/{container}/host-style-copy.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(200).body(equalTo(BLOB_CONTENT));
+    }
+
+    @Test
+    void copyBlobFromASnapshotCopiesTheSnapshotNotTheLiveBlob() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body("as snapshotted")
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+        String snapshot = given()
+            .when().put("/{account}/{container}/{blob}?comp=snapshot", ACCOUNT, CONTAINER, BLOB)
+            .then().statusCode(201)
+            .extract().header("x-ms-snapshot");
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body("changed since")
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+
+        given()
+            .header("x-ms-copy-source", "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB
+                + "?snapshot=" + snapshot)
+            .when().put("/{account}/{container}/from-snapshot.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(202);
+
+        given()
+            .when().get("/{account}/{container}/from-snapshot.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(200).body(equalTo("as snapshotted"));
+    }
+
+    @Test
+    void copyBlobKeepsALiteralPlusInTheSourceName() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, "report+2024.txt");
+
+        given()
+            .header("x-ms-copy-source", "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/report+2024.txt")
+            .when().put("/{account}/{container}/plus-copy.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(202);
+
+        given()
+            .when().get("/{account}/{container}/plus-copy.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(200).body(equalTo(BLOB_CONTENT));
+    }
+
+    @Test
+    void copyBlobWithAMalformedSourceIsInvalidHeaderValue() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+
+        given()
+            .header("x-ms-copy-source", "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/bad%ZZ.txt")
+            .when().put("/{account}/{container}/never.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(400)
+            .header("x-ms-error-code", "InvalidHeaderValue");
+    }
+
+    @Test
+    void copyBlobOntoABlobOfAnotherTypeIsInvalidBlobType() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+        given()
+            .header("x-ms-blob-type", "AppendBlob")
+            .put("/{account}/{container}/append.log", ACCOUNT, CONTAINER)
+            .then().statusCode(201);
+
+        given()
+            .header("x-ms-copy-source", "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB)
+            .when().put("/{account}/{container}/append.log", ACCOUNT, CONTAINER)
+            .then().statusCode(409)
+            .header("x-ms-error-code", "InvalidBlobType");
+
+        given()
+            .when().head("/{account}/{container}/append.log", ACCOUNT, CONTAINER)
+            .then().statusCode(200).header("x-ms-blob-type", "AppendBlob");
+    }
+
+    @Test
+    void copyBlobDropsAppendsStagedAgainstTheBlobItReplaces() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body("fresh copy")
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+        given()
+            .header("Host", ACCOUNT + ".dfs.core.windows.net")
+            .header("x-ms-version", "2023-11-03")
+            .when().put("/{container}/staged.txt?resource=file", CONTAINER)
+            .then().statusCode(201);
+        given()
+            .header("Host", ACCOUNT + ".dfs.core.windows.net")
+            .header("X-Http-Method-Override", "PATCH")
+            .contentType("application/octet-stream")
+            .body("stale".getBytes(StandardCharsets.UTF_8))
+            .queryParam("action", "append")
+            .queryParam("position", 0)
+            .when().put("/{container}/staged.txt", CONTAINER)
+            .then().statusCode(202);
+
+        given()
+            .header("x-ms-copy-source", "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB)
+            .when().put("/{account}/{container}/staged.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(202);
+        given()
+            .header("Host", ACCOUNT + ".dfs.core.windows.net")
+            .header("X-Http-Method-Override", "PATCH")
+            .queryParam("action", "flush")
+            .queryParam("position", 10)
+            .when().put("/{container}/staged.txt", CONTAINER);
+
+        given()
+            .when().get("/{account}/{container}/staged.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(200).body(equalTo("fresh copy"));
+    }
+
+    @Test
+    void copyBlobChecksTheSasASourceCarries() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+        String source = "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB + "?";
+        String readSas = urlEncoded(sas("r", "b", CONTAINER, BLOB));
+
+        given()
+            .header("x-ms-copy-source", source + readSas)
+            .when().put("/{account}/{container}/sas-copy.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(202);
+        given()
+            .header("x-ms-copy-source", source + urlEncoded(sas("w", "b", CONTAINER, BLOB)))
+            .when().put("/{account}/{container}/no-read.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(403)
+            .header("x-ms-error-code", "CannotVerifyCopySource");
+        given()
+            .header("x-ms-copy-source", source + readSas.replaceAll("sig=[^&]+", "sig=AAAA"))
+            .when().put("/{account}/{container}/bad-sig.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(403)
+            .header("x-ms-error-code", "CannotVerifyCopySource");
+    }
+
+    @Test
+    void copyBlobToANewBlobNeedsOnlyCreatePermission() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+        String source = "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB;
+
+        given()
+            .header("x-ms-copy-source", source)
+            .when().put("/{account}/{container}/create-only.txt?{sas}", ACCOUNT, CONTAINER,
+                sas("c", "b", CONTAINER, "create-only.txt"))
+            .then().statusCode(202);
+        given()
+            .header("x-ms-copy-source", source)
+            .when().put("/{account}/{container}/create-only.txt?{sas}", ACCOUNT, CONTAINER,
+                sas("c", "b", CONTAINER, "create-only.txt"))
+            .then().statusCode(403)
+            .header("x-ms-error-code", "AuthorizationPermissionMismatch");
+    }
+
+    @Test
+    void copyBlobTakesTheRequestsTagsNotTheSources() {
+        given().put("/{account}/{container}?restype=container", ACCOUNT, CONTAINER);
+        given()
+            .header("x-ms-blob-type", "BlockBlob")
+            .header("x-ms-tags", "origin=source")
+            .contentType("text/plain")
+            .body(BLOB_CONTENT)
+            .put("/{account}/{container}/{blob}", ACCOUNT, CONTAINER, BLOB);
+        String source = "http://localhost:8081/" + ACCOUNT + "/" + CONTAINER + "/" + BLOB;
+
+        given().header("x-ms-copy-source", source)
+            .when().put("/{account}/{container}/untagged.txt", ACCOUNT, CONTAINER).then().statusCode(202);
+        given().header("x-ms-copy-source", source).header("x-ms-tags", "origin=request")
+            .when().put("/{account}/{container}/tagged.txt", ACCOUNT, CONTAINER).then().statusCode(202);
+        given().header("x-ms-copy-source", source).header("x-ms-requires-sync", "true")
+            .header("x-ms-copy-source-tag-option", "COPY")
+            .when().put("/{account}/{container}/kept.txt", ACCOUNT, CONTAINER).then().statusCode(202);
+
+        given().when().head("/{account}/{container}/untagged.txt", ACCOUNT, CONTAINER)
+            .then().statusCode(200).header("x-ms-tag-count", nullValue());
+        given().when().get("/{account}/{container}/tagged.txt?comp=tags", ACCOUNT, CONTAINER)
+            .then().statusCode(200).body(containsString("<Value>request</Value>"));
+        given().when().get("/{account}/{container}/kept.txt?comp=tags", ACCOUNT, CONTAINER)
+            .then().statusCode(200).body(containsString("<Value>source</Value>"));
+    }
+
+    /**
+     * {@code sas} with each value percent-encoded, as a client builds a source URL: the signature is base64, and an
+     * unencoded {@code +} in it would be read back as a space.
+     */
+    private static String urlEncoded(String sas) {
+        return Arrays.stream(sas.split("&"))
+            .map(pair -> {
+                int eq = pair.indexOf('=');
+                return pair.substring(0, eq + 1) + URLEncoder.encode(pair.substring(eq + 1), StandardCharsets.UTF_8);
+            })
+            .collect(Collectors.joining("&"));
     }
 
     // ── Blob index tags ──────────────────────────────────────────────────────
