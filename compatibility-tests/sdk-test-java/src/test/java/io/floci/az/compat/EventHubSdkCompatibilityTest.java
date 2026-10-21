@@ -1,6 +1,7 @@
 package io.floci.az.compat;
 
 import com.azure.messaging.eventhubs.EventData;
+import com.azure.messaging.eventhubs.EventDataBatch;
 import com.azure.messaging.eventhubs.EventHubConsumerClient;
 import com.azure.messaging.eventhubs.EventHubProducerClient;
 import com.azure.messaging.eventhubs.EventHubProperties;
@@ -19,8 +20,10 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -47,6 +50,11 @@ class EventHubSdkCompatibilityTest {
     private static final int EVENT_COUNT = 8;
     /** How many events one read takes off a partition. Comfortably more than this test sends. */
     private static final int RECEIVE_LIMIT = EVENT_COUNT * 4;
+    /** The pause between two sends whose events must not share an enqueued time. */
+    private static final long SEND_PAUSE_MS = 5;
+    /** The annotations Azure sets on every event it delivers, which the SDK reads the position from. */
+    private static final Set<String> POSITION_ANNOTATIONS =
+            Set.of("x-opt-sequence-number", "x-opt-offset", "x-opt-enqueued-time");
 
     private EventHubProducerClient producer;
     private String testId;
@@ -226,6 +234,87 @@ class EventHubSdkCompatibilityTest {
                 "events sent to " + uriForm + " did not reach the partitions the SDK reads");
     }
 
+    /**
+     * The broker keeps each event's partition and stream position for its own diverts and
+     * selectors. Azure sends neither as an application property, only the position, as
+     * annotations, so that is all a client may receive.
+     */
+    @Test
+    @DisplayName("07. An event carries its position as Azure sends it, and no floci property")
+    void eventsCarryTheirPositionAsAzureSendsIt() {
+        String partitionId = partitionIds().get(0);
+        Instant sentFrom = Instant.now();
+        sendTo(partitionId, 0, EVENT_COUNT);
+
+        List<EventData> events = receiveEvents(partitionId, testStart);
+
+        assertEquals(EVENT_COUNT, events.size(), "not every event was received back");
+        long previous = -1;
+        for (EventData event : events) {
+            List<String> internal = event.getProperties().keySet().stream()
+                    .filter(key -> key.startsWith("floci_")).toList();
+            assertEquals(List.of(), internal, "the event carries properties Azure never sends");
+            Map<String, Object> annotations = event.getRawAmqpMessage().getMessageAnnotations();
+            assertTrue(annotations.keySet().containsAll(POSITION_ANNOTATIONS),
+                    "the event lacks a position annotation: " + annotations.keySet());
+            long sequence = event.getSequenceNumber();
+            assertTrue(sequence > previous, "sequence numbers do not increase: " + previous + ", " + sequence);
+            assertEquals(Long.toString(sequence), event.getOffsetString());
+            assertFalse(event.getEnqueuedTime().isBefore(sentFrom.minusSeconds(1)),
+                    "enqueued before it was sent: " + event.getEnqueuedTime());
+            assertFalse(event.getEnqueuedTime().isAfter(Instant.now()),
+                    "enqueued in the future: " + event.getEnqueuedTime());
+            previous = sequence;
+        }
+    }
+
+    @Test
+    @DisplayName("08. A receiver started at a sequence number reads from that event on")
+    void sequenceNumberPositionReadsFromThere() {
+        String partitionId = partitionIds().get(0);
+        sendTo(partitionId, 0, EVENT_COUNT);
+        List<EventData> events = receiveEvents(partitionId, testStart);
+        long middle = events.get(EVENT_COUNT / 2).getSequenceNumber();
+
+        assertReadsFrom(partitionId, EventPosition.fromSequenceNumber(middle, true), events,
+                event -> event.getSequenceNumber() >= middle);
+    }
+
+    @Test
+    @DisplayName("09. A receiver started at an offset reads the events after it")
+    void offsetPositionReadsFromThere() {
+        String partitionId = partitionIds().get(0);
+        sendTo(partitionId, 0, EVENT_COUNT);
+        List<EventData> events = receiveEvents(partitionId, testStart);
+        long middle = Long.parseLong(events.get(EVENT_COUNT / 2).getOffsetString());
+
+        EventPosition position = EventPosition.fromOffsetString(Long.toString(middle));
+
+        assertReadsFrom(partitionId, position, events, event -> position.isInclusive()
+                ? Long.parseLong(event.getOffsetString()) >= middle
+                : Long.parseLong(event.getOffsetString()) > middle);
+    }
+
+    @Test
+    @DisplayName("10. A receiver started at an enqueued time reads the events after it")
+    void enqueuedTimePositionReadsFromThere() throws InterruptedException {
+        String partitionId = partitionIds().get(0);
+        // One event per send, some milliseconds apart: the enqueued time has millisecond
+        // resolution, and events that share one cannot tell whether the position is honoured.
+        for (int i = 0; i < EVENT_COUNT; i++) {
+            sendTo(partitionId, i, 1);
+            Thread.sleep(SEND_PAUSE_MS);
+        }
+        List<EventData> events = receiveEvents(partitionId, testStart);
+        Instant middle = events.get(EVENT_COUNT / 2).getEnqueuedTime();
+
+        EventPosition position = EventPosition.fromEnqueuedTime(middle);
+
+        assertReadsFrom(partitionId, position, events, event -> position.isInclusive()
+                ? !event.getEnqueuedTime().isBefore(middle)
+                : event.getEnqueuedTime().isAfter(middle));
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     private List<String> partitionIds() {
@@ -248,21 +337,50 @@ class EventHubSdkCompatibilityTest {
         }
     }
 
-    /** Bodies of this test's own events on one partition, from {@code position} onwards. */
-    private List<String> receiveFrom(String partitionId, EventPosition position) {
-        List<String> bodies = new ArrayList<>();
+    /** Sends events {@code first} to {@code first + count - 1} to one partition, in one batch. */
+    private void sendTo(String partitionId, int first, int count) {
+        EventDataBatch batch = producer.createBatch(new CreateBatchOptions().setPartitionId(partitionId));
+        for (int i = first; i < first + count; i++) {
+            assertTrue(batch.tryAdd(event(i)), "the batch would not take event " + i);
+        }
+        producer.send(batch);
+    }
+
+    /**
+     * A receiver at {@code position} reads exactly the events {@code fromPosition} keeps, and those
+     * are some of the events but not all, so the read shows that the earlier ones are skipped.
+     */
+    private void assertReadsFrom(String partitionId, EventPosition position, List<EventData> events,
+                                 Predicate<EventData> fromPosition) {
+        List<String> expected = bodies(events, fromPosition);
+        assertFalse(expected.isEmpty(), position + " selects none of the events");
+        assertTrue(expected.size() < events.size(), position + " selects every event");
+        assertEquals(expected, receiveFrom(partitionId, position));
+    }
+
+    /** This test's own events on one partition, from {@code position} onwards, in order. */
+    private List<EventData> receiveEvents(String partitionId, EventPosition position) {
+        List<EventData> events = new ArrayList<>();
         try (EventHubConsumerClient consumer =
                      EmulatorConfig.eventHubClientBuilder()
                              .consumerGroup(CONSUMER_GROUP)
                              .buildConsumerClient()) {
             for (PartitionEvent event :
                     consumer.receiveFromPartition(partitionId, RECEIVE_LIMIT, position, RECEIVE_TIMEOUT)) {
-                EventData data = event.getData();
-                if (testId.equals(data.getProperties().get("testId"))) {
-                    bodies.add(data.getBodyAsString());
+                if (testId.equals(event.getData().getProperties().get("testId"))) {
+                    events.add(event.getData());
                 }
             }
         }
-        return bodies;
+        return events;
+    }
+
+    private static List<String> bodies(List<EventData> events, Predicate<EventData> keep) {
+        return events.stream().filter(keep).map(EventData::getBodyAsString).toList();
+    }
+
+    /** Bodies of this test's own events on one partition, from {@code position} onwards. */
+    private List<String> receiveFrom(String partitionId, EventPosition position) {
+        return bodies(receiveEvents(partitionId, position), event -> true);
     }
 }
